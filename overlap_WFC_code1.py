@@ -1,10 +1,11 @@
-import os, sys
+import os, sys, argparse
 import numpy as np
 from collections import defaultdict, deque
 import random
 from PIL import Image
 from numpy.lib.stride_tricks import sliding_window_view
 import matplotlib.pyplot as plt
+
 
 class OverlappingWFC:
     """
@@ -87,6 +88,8 @@ class OverlappingWFC:
                         rp = self.rotate90(rp)
                         add_patch(rp)
         unique = list(counts.keys())
+        print("patch size {}".format(self.N))
+        print("rotate and reflect augment:{}".format(self.augment_rot_reflect))
         print("Extracted {} unique patterns.".format(len(unique)))
         id_to_array = {}
         for pid in unique:
@@ -94,6 +97,7 @@ class OverlappingWFC:
             arr = arr.reshape(N, N, C)
             id_to_array[pid] = arr
         weights = np.array([counts[pid] for pid in unique], dtype=np.float64)
+        #weights = np.ones(len(unique), dtype=np.float64)
         weights = weights / np.sum(weights)
         pid2idx = {pid:i for i, pid in enumerate(unique)}
         idx2arr = [id_to_array[pid] for pid in unique]
@@ -241,26 +245,42 @@ class OverlappingWFC:
 # Example usage
 # ----------------------------
 if __name__ == "__main__":
+    parse = argparse.ArgumentParser(description="Run Overlapping WFC on a sample image.")
+    parse.add_argument("input_png_file", type=str, help="Path to input sample image.")
+    parse.add_argument('--patch_size', type=int, help="Size of the patterns (NxN).", default=3)
+    parse.add_argument('--out_size', type=int, nargs=2, help="Output size (height width).", default=[64,64])
+    parse.add_argument('--seed', type=int, help="Random seed for reproducibility.", default=42)
+    parse.add_argument('--periodic_input', action='store_true', help="Use periodic input for seamless tiling.")
+    parse.add_argument('--augment_rot_reflect', action='store_true', help="Use data augmentation (rotation/reflection).")
+    parse.add_argument('--run_wfc', action='store_true', help="Run the WFC algorithm.")
+    args = parse.parse_args()
+    
     # Load input sample image and convert to grayscale numpy array
-    sample = Image.open(sys.argv[1])
+    sample = Image.open(args.input_png_file)
     sample = sample.convert("L")
     sample = np.array(sample)
     print("sample input", sample.shape, sample.dtype, sample.min(), sample.max())
+    
     # Set output size and pattern size
-    out_H, out_W, N = (64, 64, 8)
+    out_H, out_W, N = args.out_size[0], args.out_size[1], args.patch_size
     Hp = out_H - N + 1
     Wp = out_W - N + 1
     # Initialize WFC model
-    wfc = OverlappingWFC(sample, N=N, overlap=N-1, periodic_input=True, augment_rot_reflect=True)
-    # Run WFC and render output
-    collapsed_grid = wfc.run(Hp, Wp, seed=42)
-    out = wfc.render(collapsed_grid)
-    # Plot input and output images
-    fig, axes = plt.subplots(1,2, figsize=(10,5))
-    axes[0].set_title("Sample Input")
-    axes[0].pcolor(sample, cmap='gray', edgecolors='blue', linewidth=0.1)
-    axes[0].invert_yaxis()
-    axes[1].set_title("Blended Output")
-    axes[1].pcolor(out, cmap='gray', edgecolors='blue', linewidth=0.1)
-    axes[1].invert_yaxis()
-    plt.show()
+    wfc = OverlappingWFC(sample, N=N, overlap=N-1,
+        periodic_input=args.periodic_input,
+        augment_rot_reflect=args.augment_rot_reflect,
+    )
+    
+    if args.run_wfc:
+        # Run WFC and render output
+        collapsed_grid = wfc.run(Hp, Wp, seed=args.seed)
+        out = wfc.render(collapsed_grid)
+        # Plot input and output images
+        fig, axes = plt.subplots(1,2, figsize=(10,5))
+        axes[0].set_title("Sample Input")
+        axes[0].pcolor(sample, cmap='gray', edgecolors='blue', linewidth=0.1)
+        axes[0].invert_yaxis()
+        axes[1].set_title("Blended Output")
+        axes[1].pcolor(out, cmap='gray', edgecolors='blue', linewidth=0.1)
+        axes[1].invert_yaxis()
+        plt.show()
