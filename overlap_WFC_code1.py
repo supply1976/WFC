@@ -1,6 +1,7 @@
 import ast
 import json
 import os, argparse
+import hashlib
 import numpy as np
 import pandas as pd
 from collections import defaultdict, deque
@@ -129,6 +130,10 @@ class OverlappingWFC:
                 key = self.pattern_id(patch)
                 sample_grid[r, c] = key2idx[key]
         self.sample_grid = sample_grid
+        # cache the empirical distribution from the raw sample extraction (no augmentation)
+        sample_counts = np.bincount(sample_grid.reshape(-1), minlength=len(unique_keys)).astype(np.float64)
+        self.sample_counts = sample_counts
+        self.sample_distribution = sample_counts / sample_counts.sum()
         return key2idx, idx2arr, weights
     
     def build_compatibility(self):
@@ -375,46 +380,282 @@ class OverlappingWFC:
         np.savez_compressed(output_fn + "_collapsed_grid.npz", collapsed_grid=collapsed_grid)
         Image.fromarray(outimg).save(output_fn + ".png")
         return outimg
+
+    def analyze_output_distribution(self, wfc_grid, use_augmented_counts=False, epsilon=1e-12):
+        """
+        Compare pattern distribution of a generated grid against the sample via KL-divergence.
+        Args:
+            wfc_grid: 2D array of pattern indices produced by run(...)
+            use_augmented_counts: if True, compare against augmented pattern counts (rot/flip);
+                otherwise use the raw NxN extraction from the input sample.
+            epsilon: numerical floor to avoid log(0)
+        Returns:
+            dict with sample/output counts and distributions plus KL value (sample || output)
+        """
+        if wfc_grid.ndim != 2:
+            raise ValueError("wfc_grid must be a 2D array of pattern indices.")
+        if wfc_grid.size == 0:
+            raise ValueError("wfc_grid is empty.")
+        if wfc_grid.max() >= self.K or wfc_grid.min() < 0:
+            raise ValueError("wfc_grid contains invalid pattern indices.")
+
+        # output distribution from generated grid
+        out_counts = np.bincount(wfc_grid.reshape(-1), minlength=self.K).astype(np.float64)
+        out_dist = out_counts / out_counts.sum()
+
+        # sample distribution baseline
+        if use_augmented_counts:
+            sample_counts = np.array([self.catalog.at[i, 'count'] for i in range(self.K)], dtype=np.float64)
+        else:
+            sample_counts = getattr(self, "sample_counts", None)
+            if sample_counts is None:
+                sample_counts = np.bincount(self.sample_grid.reshape(-1), minlength=self.K).astype(np.float64)
+                self.sample_counts = sample_counts
+                self.sample_distribution = sample_counts / sample_counts.sum()
+        sample_dist = sample_counts / sample_counts.sum()
+
+        safe_out = np.clip(out_dist, epsilon, 1.0)
+        safe_sample = np.clip(sample_dist, epsilon, 1.0)
+        kl = float(np.sum(safe_sample * np.log(safe_sample / safe_out)))
+        return {
+            "kl_divergence": kl,
+            "sample_counts": sample_counts,
+            "sample_distribution": sample_dist,
+            "output_counts": out_counts,
+            "output_distribution": out_dist,
+            "missing_in_output": np.where((sample_counts > 0) & (out_counts == 0))[0],
+        }
+
+    def plot_distribution_bars(self, sample_dist, output_dist, title="Pattern distribution"):
+        """
+        Plot side-by-side bars comparing sample vs generated pattern distributions.
+        """
+        ids = np.arange(self.K)
+        width = 0.4
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.bar(ids - width / 2, sample_dist, width=width, label="sample")
+        ax.bar(ids + width / 2, output_dist, width=width, label="output")
+        ax.set_xlabel("pattern id")
+        ax.set_ylabel("probability")
+        ax.set_title(title)
+        ax.legend()
+        ax.set_xticks(ids)
+        ax.set_xticklabels(ids, rotation=90)
+        plt.tight_layout()
+        return fig, ax
     
-    def markov_random_field(self, H, W, seed=None, start_token=None):
+    def markov_random_field(
+        self,
+        H,
+        W,
+        seed=None,
+        start_token=None,
+        max_sweeps=100,
+        max_restarts=100,
+        repair_radius=1,
+    ):
         """
         Generate a field using the Markov Random Field model.
         Args:
             H, W: output field size (height, width)
             seed: random seed for reproducibility
             start_token: optional starting token index at (0,0)
+            max_sweeps: number of Gibbs-like refinement sweeps before checking validity
+            max_restarts: number of times to randomize the entire grid if conflicts persist
+            repair_radius: radius of local patches randomized when conflicts appear
         Returns:
             grid: (H, W) array of pattern indices (token IDs)
         """
-        # row-major order implementation
         rng = np.random.default_rng(seed)
-        if start_token is None:
-            start_token = rng.choice(np.arange(self.K), p=self.weights)
-        # initialize grid with -1 (wildcard)
-        grid = np.full((H, W), -1, dtype=int)
-        grid[0, 0] = start_token
-        
-        for r in range(H):
-            for c in range(W):
-                if r == 0 and c == 0:
+        tokens = np.arange(self.K)
+        weights = self.weights
+        full_token_set = set(range(self.K))
+
+        def init_grid():
+            g = rng.choice(tokens, size=(H, W), p=weights)
+            if start_token is not None:
+                g[0, 0] = start_token
+            return g
+
+        def candidate_set(r, c, grid):
+            """Return candidate tokens compatible with all current neighbors."""
+            constraints = []
+            if r > 0:
+                constraints.append(self.allow[grid[r-1, c]][self.DOWN])
+            if r + 1 < H:
+                constraints.append(self.allow[grid[r+1, c]][self.UP])
+            if c > 0:
+                constraints.append(self.allow[grid[r, c-1]][self.RIGHT])
+            if c + 1 < W:
+                constraints.append(self.allow[grid[r, c+1]][self.LEFT])
+            if not constraints:
+                return set(full_token_set)
+            candidates = set(constraints[0])
+            for neighbor_set in constraints[1:]:
+                candidates &= neighbor_set
+                if not candidates:
+                    break
+            return candidates
+
+        def grid_is_valid(grid):
+            """Check local compatibility for all edges to guard against false positives."""
+            for r in range(H):
+                for c in range(W):
+                    token = grid[r, c]
+                    if r > 0:
+                        north = grid[r - 1, c]
+                        if token not in self.allow[north][self.DOWN]:
+                            return False
+                        if north not in self.allow[token][self.UP]:
+                            return False
+                    if c > 0:
+                        west = grid[r, c - 1]
+                        if token not in self.allow[west][self.RIGHT]:
+                            return False
+                        if west not in self.allow[token][self.LEFT]:
+                            return False
+            return True
+
+        grid = init_grid()
+        for restart in range(max_restarts):
+            for _ in range(max_sweeps):
+                changed = False
+                conflict_cells = []
+                order = rng.permutation(H * W)
+                for idx in order:
+                    r, c = divmod(idx, W)
+                    if start_token is not None and r == 0 and c == 0:
+                        continue
+                    candidates = candidate_set(r, c, grid)
+                    if not candidates:
+                        conflict_cells.append((r, c))
+                        continue
+                    cand_list = np.fromiter(candidates, dtype=int)
+                    probs = weights[cand_list]
+                    if probs.sum() == 0:
+                        probs = np.ones_like(probs) / probs.size
+                    else:
+                        probs = probs / probs.sum()
+                    new_val = rng.choice(cand_list, p=probs)
+                    if new_val != grid[r, c]:
+                        grid[r, c] = new_val
+                        changed = True
+                if not conflict_cells and (not changed or grid_is_valid(grid)):
+                    if grid_is_valid(grid):
+                        return grid
+                if conflict_cells:
+                    for r, c in conflict_cells:
+                        r0 = max(0, r - repair_radius)
+                        r1 = min(H, r + repair_radius + 1)
+                        c0 = max(0, c - repair_radius)
+                        c1 = min(W, c + repair_radius + 1)
+                        patch_shape = (r1 - r0, c1 - c0)
+                        grid[r0:r1, c0:c1] = rng.choice(tokens, size=patch_shape, p=weights)
+                    if start_token is not None:
+                        grid[0, 0] = start_token
+            if grid_is_valid(grid):
+                return grid
+            grid = init_grid()
+
+        raise RuntimeError(
+            "MRF synthesis failed to find a consistent assignment; try increasing max_sweeps or max_restarts."
+        )
+
+    def energy_minimization(
+        self,
+        H,
+        W,
+        seed=None,
+        max_iters=200000,
+        max_restarts=5,
+        temp_start=1.0,
+        temp_end=0.05,
+        debug_energy=False,
+    ):
+        """
+        Simulated annealing-style energy minimization on the pattern grid.
+        Energy counts local compatibility violations; target energy 0 means a valid tiling.
+        """
+        rng = np.random.default_rng(seed)
+        tokens = np.arange(self.K)
+        weights = self.weights
+
+        def init_grid():
+            return rng.choice(tokens, size=(H, W), p=weights)
+
+        def local_energy(grid, r, c, token=None):
+            """Energy contribution around cell (r,c); counts incompatible neighbor edges."""
+            if token is None:
+                token = grid[r, c]
+            e = 0
+            if r > 0:
+                north = grid[r - 1, c]
+                if token not in self.allow[north][self.DOWN]:
+                    e += 1
+                if north not in self.allow[token][self.UP]:
+                    e += 1
+            if r + 1 < H:
+                south = grid[r + 1, c]
+                if token not in self.allow[south][self.UP]:
+                    e += 1
+                if south not in self.allow[token][self.DOWN]:
+                    e += 1
+            if c > 0:
+                west = grid[r, c - 1]
+                if token not in self.allow[west][self.RIGHT]:
+                    e += 1
+                if west not in self.allow[token][self.LEFT]:
+                    e += 1
+            if c + 1 < W:
+                east = grid[r, c + 1]
+                if token not in self.allow[east][self.LEFT]:
+                    e += 1
+                if east not in self.allow[token][self.RIGHT]:
+                    e += 1
+            return e
+
+        def total_energy(grid):
+            e = 0
+            for r in range(H):
+                for c in range(W):
+                    e += local_energy(grid, r, c)
+            return e * 0.5  # each edge counted twice
+
+        for restart in range(max_restarts):
+            grid = init_grid()
+            best_grid = grid.copy()
+            best_e = total_energy(grid)
+            if debug_energy:
+                print(f"[energy] restart {restart+1}/{max_restarts}, init energy={best_e}")
+            if best_e == 0:
+                return grid
+            for it in range(max_iters):
+                t = temp_start + (temp_end - temp_start) * (it / max_iters)
+                r = rng.integers(0, H)
+                c = rng.integers(0, W)
+                current = grid[r, c]
+                proposal = rng.choice(tokens, p=weights)
+                if proposal == current:
                     continue
-                # start with all possible tokens
-                possible_tokens = set(range(self.K))
-                if r > 0:
-                    north_token = grid[r-1, c]
-                    if north_token != -1:
-                        possible_tokens &= self.allow[north_token][self.DOWN]
-                if c > 0:
-                    west_token = grid[r, c-1]
-                    if west_token != -1:
-                        possible_tokens &= self.allow[west_token][self.RIGHT]
-                if possible_tokens:
-                    selected = rng.choice(list(possible_tokens))
-                    grid[r, c] = selected
-                else:
-                    # no candidates; leave as -1 wildcard
-                    grid[r, c] = -1
-        return grid
+                e_before = local_energy(grid, r, c, current)
+                e_after = local_energy(grid, r, c, proposal)
+                delta = e_after - e_before
+                if delta <= 0 or rng.random() < np.exp(-delta / max(t, 1e-6)):
+                    grid[r, c] = proposal
+                # periodic full energy check
+                if it % 200 == 0 or delta < 0:
+                    e_tot = total_energy(grid)
+                    if debug_energy and it % 1000 == 0:
+                        print(f"[energy] restart {restart+1} iter {it}: energy={e_tot}")
+                    if e_tot < best_e:
+                        best_e = e_tot
+                        best_grid = grid.copy()
+                    if e_tot == 0:
+                        return grid
+            # restart with best grid so far if valid, else randomize
+            if best_e == 0:
+                return best_grid
+        raise RuntimeError("Energy minimization failed to find a consistent assignment; try increasing max_iters or max_restarts.")
 
 # ----------------------------
 # Example usage
@@ -425,19 +666,22 @@ if __name__ == "__main__":
     parse.add_argument('--patch_size', type=int, help="Size of the patterns (NxN).", default=3)
     parse.add_argument('--out_size', type=int, nargs=2, help="Output size (height width).", default=[64,64])
     parse.add_argument('--seed', type=int, help="Random seed for reproducibility.", default=None)
+    parse.add_argument('--num_trials', type=int, help="Number of synthesis trials (unique seeds each).", default=1)
     parse.add_argument('--periodic_input', action='store_true', help="Use periodic input for seamless tiling.")
     parse.add_argument('--augment_rot_reflect', action='store_true', help="Use data augmentation (rotation/reflection).")
     parse.add_argument('--convert_grayscale', action='store_true', help="Convert input image to grayscale.")
     parse.add_argument('--run_wfc', action='store_true', help="Run the WFC algorithm.")
+    parse.add_argument('--method', choices=['wfc', 'energy', 'both'], default='wfc', help="Synthesis method to use.")
+    parse.add_argument('--debug_energy', action='store_true', help="Print energy over iterations for energy minimization.")
     args = parse.parse_args()
-    
+        
     # Load input sample image and convert to grayscale numpy array
     sample = Image.open(args.input_png_file)
     if args.convert_grayscale:
         sample = sample.convert("L")
     sample = np.array(sample)
     print("sample input", sample.shape, sample.dtype, sample.min(), sample.max())
-    
+        
     # Set output size and pattern size
     out_H, out_W, N = args.out_size[0], args.out_size[1], args.patch_size
     cell_grid_h = out_H - N + 1
@@ -449,34 +693,183 @@ if __name__ == "__main__":
         )
     #wfc.weights = np.ones_like(wfc.weights) / len(wfc.weights)  # uniform weights
     print("sample grid of pattern indices:\n", wfc.sample_grid)
-    # transitions = wfc.get_transitions_matrix()
-    # check
-    #wfc.plot_neighbors(idx=58)
     output_dir = os.path.splitext(os.path.basename(args.input_png_file))[0] + "_WFC_outputs"
     os.makedirs(output_dir, exist_ok=True)
     output_fn = "overlapN{}_out{}x{}".format(N, out_H, out_W)
     output_fn = os.path.join(output_dir, output_fn)
-    
+        
     if args.run_wfc:
-        start_time = time()
-        # Run WFC and render output
-        wfc_grid = wfc.run(cell_grid_h, cell_grid_w, seed=args.seed)
-        mrf_grid = wfc.markov_random_field(cell_grid_h, cell_grid_w, seed=args.seed, start_token=wfc_grid[0,0])
-        wfc_out = wfc.render(wfc_grid, output_fn=output_fn, blend_average=True)
-        mrf_out = wfc.render(mrf_grid, output_fn=output_fn + "_MRF", blend_average=True)
-        print("WFC generation and rendering took {:.2f} seconds.".format(time() - start_time))
+        methods = []
+        if args.method in ("wfc", "both"):
+            methods.append("wfc")
+        if args.method in ("energy", "both"):
+            methods.append("energy")
 
-        # Plot input and output images
-        cmap = 'gray' if sample.ndim == 2 else None
-        fig, axes = plt.subplots(1,3, figsize=(12,4))
-        axes[0].set_title("Sample Input: {}".format(sample.shape))
-        axes[0].pcolor(sample, cmap=cmap, edgecolors='blue', linewidth=0.1)
-        axes[0].invert_yaxis()
-        axes[1].set_title("WFC Output: {}, patch size = {}".format(wfc_out.shape, N))
-        axes[1].pcolor(wfc_out, cmap=cmap, edgecolors='blue', linewidth=0.1)
-        axes[1].invert_yaxis()
-        axes[2].set_title("MRF Output: {}, patch size = {}".format(mrf_out.shape, N))
-        axes[2].pcolor(mrf_out, cmap=cmap, edgecolors='blue', linewidth=0.1)
-        axes[2].invert_yaxis()
+        rng_trials = np.random.default_rng(args.seed)
+        total_start = time()
+        trial_records = []
+        method_data = {
+            m: {
+                "records": [],
+                "grids": [],
+                "imgs": [],
+                "seeds": [],
+                "failed": [],
+                "last_analysis": None,
+                "last_img": None,
+            } for m in methods
+        }
 
-    plt.show()
+        for trial in range(args.num_trials):
+            trial_seed = int(rng_trials.integers(0, 2**32 - 1, dtype=np.uint32))
+            for method in methods:
+                start_time = time()
+                try:
+                    if method == "wfc":
+                        grid = wfc.run(cell_grid_h, cell_grid_w, seed=trial_seed)
+                    else:
+                        grid = wfc.energy_minimization(
+                            cell_grid_h,
+                            cell_grid_w,
+                            seed=trial_seed,
+                            debug_energy=args.debug_energy and args.num_trials == 1,
+                        )
+                    analysis = wfc.analyze_output_distribution(
+                        grid,
+                        use_augmented_counts=args.augment_rot_reflect,
+                    )
+                    method_data[method]["grids"].append(grid)
+                    method_data[method]["seeds"].append(trial_seed)
+                    method_data[method]["last_analysis"] = analysis
+                    record = {
+                        "method": method,
+                        "trial": trial + 1,
+                        "seed": trial_seed,
+                        "status": "success",
+                        "kl_divergence": analysis["kl_divergence"],
+                        "missing_patterns": ";".join(map(str, analysis["missing_in_output"].tolist())) if analysis["missing_in_output"].size > 0 else "",
+                        "elapsed_sec": time() - start_time,
+                        "error": "",
+                    }
+                    trial_records.append(record)
+                    method_data[method]["records"].append(record)
+                    trial_base = f"{output_fn}_{method}_trial{trial+1}_seed{trial_seed}"
+                    out_img = wfc.render(grid, output_fn=trial_base, blend_average=True)
+                    method_data[method]["imgs"].append(out_img)
+                    method_data[method]["last_img"] = out_img
+                    if args.num_trials == 1 and method == "wfc":
+                        print("Pattern KL-divergence (sample||output): {:.6f}".format(analysis["kl_divergence"]))
+                        print("wfc_grid shape:", grid.shape, "patterns used:", np.unique(grid).size, "/", wfc.K)
+                        if analysis["missing_in_output"].size > 0:
+                            print("Pattern ids missing in output but present in sample:", analysis["missing_in_output"].tolist())
+                        else:
+                            print("All sample patterns appeared in the output.")
+                        wfc.plot_distribution_bars(
+                            sample_dist=analysis["sample_distribution"],
+                            output_dist=analysis["output_distribution"],
+                            title="Pattern distribution (sample vs output)",
+                        )
+                    print(f"[trial {trial+1}/{args.num_trials}] {method} succeeded in {time() - start_time:.2f}s (seed={trial_seed})")
+                except Exception as exc:
+                    method_data[method]["failed"].append((trial_seed, str(exc)))
+                    record = {
+                        "method": method,
+                        "trial": trial + 1,
+                        "seed": trial_seed,
+                        "status": "fail",
+                        "kl_divergence": "",
+                        "missing_patterns": "",
+                        "elapsed_sec": time() - start_time,
+                        "error": str(exc),
+                    }
+                    trial_records.append(record)
+                    method_data[method]["records"].append(record)
+                    print(f"[trial {trial+1}/{args.num_trials}] {method} FAILED (seed={trial_seed}): {exc}")
+
+        elapsed = time() - total_start
+        print(f"Total synthesis wall time: {elapsed:.2f}s")
+
+        for method in methods:
+            records = method_data[method]["records"]
+            successes = [r for r in records if r["status"] == "success"]
+            success = len(successes)
+            print(f"{method.upper()} success: {success}/{args.num_trials} ({success/args.num_trials:.2%})")
+            if method_data[method]["failed"]:
+                failed = method_data[method]["failed"]
+                print(f"{method.upper()} failed seeds (seed, error):", failed[:10], ("... (+more)" if len(failed) > 10 else ""))
+            last_analysis = method_data[method]["last_analysis"]
+            if last_analysis is not None and args.num_trials > 1:
+                print(f"{method.upper()} last successful trial KL-divergence (sample||output): {last_analysis['kl_divergence']:.6f}")
+                if last_analysis["missing_in_output"].size > 0:
+                    print(f"{method.upper()} last trial missing patterns:", last_analysis["missing_in_output"].tolist())
+            grids = method_data[method]["grids"]
+            imgs = method_data[method]["imgs"]
+            if imgs:
+                out_arr = np.stack(imgs, axis=0)
+                grid_arr = np.stack(grids, axis=0)
+                seeds_arr = np.array(method_data[method]["seeds"], dtype=np.uint32)
+                all_npz = os.path.join(
+                    output_dir,
+                    f"all_outputs_{method}_N{N}_out{out_H}x{out_W}_{args.num_trials}_runs_seed{args.seed if args.seed is not None else 'rng'}.npz",
+                )
+                np.savez_compressed(all_npz, seeds=seeds_arr, outputs=out_arr, collapsed_grids=grid_arr)
+                print(f"Saved aggregated outputs for {method} to", all_npz)
+            if len(grids) > 1:
+                flat = [g.reshape(-1) for g in grids]
+                hashes = [hashlib.sha1(g.tobytes()).hexdigest() for g in grids]
+                unique_hashes = len(set(hashes))
+                pairwise_diff = []
+                for i in range(len(flat)):
+                    for j in range(i+1, len(flat)):
+                        diff = np.mean(flat[i] != flat[j])
+                        pairwise_diff.append(diff)
+                mean_diff = float(np.mean(pairwise_diff)) if pairwise_diff else 0.0
+                min_diff = float(np.min(pairwise_diff)) if pairwise_diff else 0.0
+                max_diff = float(np.max(pairwise_diff)) if pairwise_diff else 0.0
+                print(f"{method.upper()} similarity (token grids): unique={unique_hashes}/{len(grids)}, "
+                      f"pairwise token mismatch mean={mean_diff:.4f}, min={min_diff:.4f}, max={max_diff:.4f}")
+
+        # Cross-method comparison if both produced outputs
+        if "wfc" in methods and "energy" in methods:
+            w_map = {s: g for s, g in zip(method_data["wfc"]["seeds"], method_data["wfc"]["grids"])}
+            e_map = {s: g for s, g in zip(method_data["energy"]["seeds"], method_data["energy"]["grids"])}
+            common = sorted(set(w_map.keys()) & set(e_map.keys()))
+            if common:
+                diffs = []
+                identical = 0
+                for s in common:
+                    wg = w_map[s]
+                    eg = e_map[s]
+                    mismatch = np.mean(wg.reshape(-1) != eg.reshape(-1))
+                    diffs.append(mismatch)
+                    if mismatch == 0:
+                        identical += 1
+                mean_diff = float(np.mean(diffs))
+                print(f"Cross-method (wfc vs energy) on {len(common)} shared seeds: mean token mismatch={mean_diff:.4f}, identical outputs={identical}")
+
+        if trial_records:
+            trial_df = pd.DataFrame(trial_records)
+            trials_csv = os.path.join(
+                output_dir,
+                f"trials_N{N}_out{out_H}x{out_W}_{args.num_trials}_runs_seed{args.seed if args.seed is not None else 'rng'}.csv",
+            )
+            trial_df.to_csv(trials_csv, index=False)
+            print("Saved trial log to", trials_csv)
+
+        # Plot input and output images for single-trial runs
+        if args.run_wfc and args.num_trials == 1:
+            plot_methods = [m for m in methods if method_data[m]["last_img"] is not None]
+            if plot_methods:
+                cmap = 'gray' if sample.ndim == 2 else None
+                fig, axes = plt.subplots(1, len(plot_methods) + 1, figsize=(4*(len(plot_methods)+1), 4))
+                axes = np.atleast_1d(axes)
+                axes[0].set_title("Sample Input: {}".format(sample.shape))
+                axes[0].pcolor(sample, cmap=cmap, edgecolors='blue', linewidth=0.1)
+                axes[0].invert_yaxis()
+                for i, method in enumerate(plot_methods, start=1):
+                    img = method_data[method]["last_img"]
+                    axes[i].set_title(f"{method.upper()} Output: {img.shape}, N={N}")
+                    axes[i].pcolor(img, cmap=cmap, edgecolors='blue', linewidth=0.1)
+                    axes[i].invert_yaxis()
+                plt.tight_layout()
+                plt.show()
